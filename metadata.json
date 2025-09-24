@@ -1,5 +1,5 @@
 {
-  "name": " AI Slide Generation Studio ver 4.0",
+  "name": "AI Slide Generation Studio ver 4.2 - N8N DB",
   "description": "An intelligent application that assists users in creating structured and engaging presentation slides for both general and microlearning courses. Users can define the course structure or let AI generate it, configure content types, and produce a complete slide deck.",
   "requestFramePermissions": []
 }

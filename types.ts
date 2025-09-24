@@ -95,7 +95,8 @@ export interface SlideGenState {
   isRetrievingContent: boolean;
   isExporting: boolean;
   generatedSlides: GeneratedSlide[];
-  conversationId: string | null;
+  runId: string | null; // client-side correlation id for n8n
+  glmConversationId: string | null; // For GLM revisions
   error: string | null;
   lastPrompt: string;
   apiLogs: string[];

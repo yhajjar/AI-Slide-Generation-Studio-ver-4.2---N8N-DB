@@ -2,7 +2,8 @@ import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import type { CourseData, GeneratedSlide, GeneralCourseSlide, MicrolearningSlide, KbStatus, AgenticMode, SlideGenState } from './types';
 import { CourseType, StructureMethod } from './types';
 import { MIN_SLIDES_GENERAL, MIN_SLIDES_MICRO, ALL_GENERAL_CONTENT_TYPES, ALL_MICROLEARNING_CONTENT_TYPES } from './constants';
-import { addPage, updatePage, processDocument, retrieveGeneratedContent, retrieveKbChunks } from './glmApi';
+import { addPage, updatePage } from './glmApi';
+import { upsertDocument, retrieveGroundTruth, SlideRequestInfo } from './n8nApi';
 import JSZip from 'jszip';
 
 import StepIndicator from './components/StepIndicator';
@@ -146,6 +147,25 @@ const inlineImagesAsDataURI = async (html: string, onLog: (message: string) => v
     }
 };
 
+const buildSlidesRequestPayload = (slides: (GeneralCourseSlide | MicrolearningSlide)[] | undefined): SlideRequestInfo[] => {
+    if (!slides) return [];
+
+    return slides.map(slide => {
+        const microSlide = slide as MicrolearningSlide;
+        const interactive = (microSlide.interactives && microSlide.interactives.length > 0)
+            ? microSlide.interactives[0]
+            : 'None';
+        
+        return {
+            id: slide.id,
+            contentType: slide.contentType,
+            autoMode: slide.autoMode,
+            userContent: slide.userContent,
+            interactive: interactive,
+        };
+    });
+};
+
 
 const App: React.FC = () => {
     const [state, setState] = useState<SlideGenState>({
@@ -158,7 +178,8 @@ const App: React.FC = () => {
         isRetrievingContent: false,
         isExporting: false,
         generatedSlides: [],
-        conversationId: null,
+        runId: null,
+        glmConversationId: null,
         error: null,
         lastPrompt: '',
         apiLogs: [],
@@ -168,7 +189,14 @@ const App: React.FC = () => {
     
     const abortControllerRef = useRef<AbortController | null>(null);
     
-    const { step, courseData, kbStatus, kbError, mode, isLoading, isRetrievingContent, isExporting, generatedSlides, conversationId, error } = state;
+    const { step, courseData, kbStatus, kbError, mode, isLoading, isRetrievingContent, isExporting, generatedSlides, runId, glmConversationId, error } = state;
+
+    useEffect(() => {
+        if (!state.runId) {
+            setState(prev => ({ ...prev, runId: crypto.randomUUID() }));
+        }
+    }, [state.runId]);
+
 
     useEffect(() => {
         return () => {
@@ -195,22 +223,31 @@ const App: React.FC = () => {
     }, []);
 
     const handleFileUpload = useCallback(async (file: File) => {
-        setState(prev => ({...prev, apiLogs: [], kbError: null, kbStatus: 'idle'}));
+        if (!runId) {
+            handleLog('[Doc Flow] Error: runId is missing.');
+            setState(prev => ({
+                ...prev,
+                kbError: 'A session ID is missing. Please refresh and try again.',
+                kbStatus: 'error'
+            }));
+            return;
+        }
+        setState(prev => ({...prev, apiLogs: [], kbError: null, kbStatus: 'uploading'}));
         const topic = file.name.split('.').slice(0, -1).join('.').replace(/_/g, ' ');
 
         handleUpdateCourseData({ fileName: file.name, courseTopic: topic, kbId: undefined });
-        handleLog(`[Doc Flow] Starting document processing for: ${file.name}`);
+        handleLog(`[Doc Flow] Starting document processing for: ${file.name} with n8n.`);
 
         try {
-            const { kbId } = await processDocument(
+            const { sourceId } = await upsertDocument(
                 file,
-                apiKey,
-                (status: KbStatus) => setState(prev => ({ ...prev, kbStatus: status })),
+                { runId, topic },
                 handleLog
             );
             
-            handleUpdateCourseData({ kbId });
-            handleLog(`[Doc Flow] Document processed successfully. KB ID: ${kbId}`);
+            handleUpdateCourseData({ kbId: sourceId });
+            handleLog(`[Doc Flow] Document processed successfully via n8n. Source ID: ${sourceId}`);
+            setState(prev => ({...prev, kbStatus: 'ready' }));
         } catch (err: any) {
             handleLog(`[Doc Flow] Error: ${err.message}`);
             setState(prev => ({
@@ -219,28 +256,46 @@ const App: React.FC = () => {
                 kbStatus: 'error'
             }));
         }
-    }, [handleLog, handleUpdateCourseData]);
+    }, [handleLog, handleUpdateCourseData, runId]);
     
     const handleRetrieveContent = useCallback(async () => {
-        setState(prev => ({ ...prev, isRetrievingContent: true, error: null }));
-        handleLog('[App] Retrieving auto-generated content from document...');
-        try {
-            const result = await retrieveGeneratedContent(courseData as CourseData, apiKey, handleLog);
-            const retrievedSlides = result;
+        if (!runId || !courseData.kbId || !courseData.courseTopic || !courseData.slides || !courseData.courseType) {
+            const message = "Missing required data for content retrieval (runId, sourceId, topic, courseType, or slides).";
+            setState(prev => ({ ...prev, error: message }));
+            handleLog(`[App] Error: ${message}`);
+            return;
+        }
 
-            const updatedSlidesMap = new Map(retrievedSlides.map((s) => [s.id, s]));
+        setState(prev => ({ ...prev, isRetrievingContent: true, error: null }));
+        handleLog('[App] Retrieving auto-generated content from document via n8n...');
+        
+        const slidesPayload = buildSlidesRequestPayload(courseData.slides as (GeneralCourseSlide | MicrolearningSlide)[]);
+
+        try {
+            const items = await retrieveGroundTruth({
+                runId,
+                sourceId: courseData.kbId,
+                topic: courseData.courseTopic,
+                courseType: courseData.courseType,
+                slides: slidesPayload,
+            }, handleLog);
+            
+            // Map by id to avoid ordering issues
+            const contentById = new Map(items.map(it => [it.id, it.SlideContent]));
 
             setState(prev => {
                 const { courseData: currentCourseData } = prev;
                 if (!currentCourseData || !currentCourseData.slides) return prev;
 
-                const newSlides = currentCourseData.slides.map(existingSlide => {
-                    const updatedSlide = updatedSlidesMap.get(existingSlide.id);
-                    if (updatedSlide && existingSlide.autoMode) { // Only update slides that were in auto-mode
+                const newSlides = currentCourseData.slides.map((existingSlide, index) => {
+                    const slideNumber = index + 1;
+                    const retrievedContent = contentById.get(slideNumber);
+
+                    // Only update slides that were in auto-mode and have content from n8n
+                    if (retrievedContent && existingSlide.autoMode) {
                         return {
                             ...existingSlide,
-                            userContent: updatedSlide.userContent || existingSlide.userContent,
-                            autoMode: false, // Set to false so the user can see and edit the new content
+                            userContent: retrievedContent,
                         };
                     }
                     return existingSlide;
@@ -249,15 +304,15 @@ const App: React.FC = () => {
                 return { ...prev, courseData: { ...currentCourseData, slides: newSlides } };
             });
 
-            handleLog('[App] Successfully updated slides with generated content.');
+            handleLog('[App] Successfully updated slides with generated content from n8n.');
         } catch (err: any) {
-            const message = err.message || 'Failed to retrieve content.';
+            const message = err.message || 'Failed to retrieve content from n8n.';
             setState(prev => ({ ...prev, error: message }));
             handleLog(`[App] Error retrieving content: ${message}`);
         } finally {
             setState(prev => ({ ...prev, isRetrievingContent: false }));
         }
-    }, [courseData, handleLog]);
+    }, [courseData, handleLog, runId]);
     
     const handleNext = useCallback(() => {
         if (step === 2 && courseData.structureMethod === StructureMethod.AI) {
@@ -309,7 +364,7 @@ const App: React.FC = () => {
         abortControllerRef.current = new AbortController();
         const controller = abortControllerRef.current;
         
-        setState(prev => ({ ...prev, isLoading: true, error: null, generatedSlides: [], conversationId: null, apiLogs: [], step: 5 }));
+        setState(prev => ({ ...prev, isLoading: true, error: null, generatedSlides: [], glmConversationId: null, apiLogs: [], step: 5 }));
 
         const generationTimeout = setTimeout(() => {
             handleLog('[App] Generation timed out after 5 minutes.');
@@ -338,13 +393,26 @@ const App: React.FC = () => {
 
         try {
             let groundTruth: string | undefined = undefined;
-            if (courseData.structureMethod === StructureMethod.DOCUMENT && courseData.kbId) {
-                handleLog('[App] Retrieving ground truth from document...');
+            if (courseData.structureMethod === StructureMethod.DOCUMENT && courseData.kbId && runId && courseData.courseType) {
+                handleLog('[App] Retrieving ground truth from document via n8n...');
                 try {
-                    groundTruth = await retrieveKbChunks(courseData.courseTopic!, courseData.kbId, apiKey, handleLog);
+                    const slidesPayload = buildSlidesRequestPayload(courseData.slides as (GeneralCourseSlide | MicrolearningSlide)[]);
+                    const items = await retrieveGroundTruth({
+                        runId,
+                        sourceId: courseData.kbId,
+                        topic: courseData.courseTopic!,
+                        courseType: courseData.courseType,
+                        slides: slidesPayload,
+                    }, handleLog);
+                    
+                    const sortedItems = items.sort((a, b) => a.id - b.id);
+                    groundTruth = sortedItems
+                        .map(item => `### Slide ${item.id}\n${item.SlideContent}`)
+                        .join('\n\n---\n\n');
+
                 } catch (e: any) {
                     clearTimeout(generationTimeout);
-                    setState(prev => ({ ...prev, error: `Failed to retrieve context from document: ${e.message}`, isLoading: false }));
+                    setState(prev => ({ ...prev, error: `Failed to retrieve context from document via n8n: ${e.message}`, isLoading: false }));
                     return;
                 }
             }
@@ -366,7 +434,7 @@ const App: React.FC = () => {
                         scope: "render.pipeline",
                         msg: `Received ${slides.length} slides; slide[0] bytes=${slides[0]?.html?.length ?? 0}, doctype=${/^\s*<!doctype/i.test(slides[0]?.html || "")}, hasEscapes=${/\\n|\\"/.test(slides[0]?.html || "")}`
                     });
-                    setState(prev => ({...prev, conversationId: convId, isLoading: false, generatedSlides: slides }));
+                    setState(prev => ({...prev, glmConversationId: convId, isLoading: false, generatedSlides: slides }));
                     if (slides.length === 0) {
                         handleLog(`[App] Stream complete, but no slide data was received.`);
                         setState(prev => ({...prev, error: "Generation finished, but the AI did not produce any slides. This might be due to a restrictive prompt or an API issue. Please try modifying your request or starting over."}));
@@ -390,11 +458,11 @@ const App: React.FC = () => {
             setState(prev => ({...prev, error: err.message, isLoading: false }));
             handleLog(`[App] Error during generation setup: ${err.message}`);
         }
-    }, [courseData, handleLog, mode]);
+    }, [courseData, handleLog, mode, runId]);
     
     const handleUpdateSlide = useCallback((slideIndex: number, instruction: string) => {
-        if (!conversationId) {
-            setState(prev => ({...prev, error: "Cannot update slide. Missing Conversation ID."}));
+        if (!glmConversationId) {
+            setState(prev => ({...prev, error: "Cannot update slide. Missing GLM Conversation ID."}));
             return;
         }
 
@@ -432,7 +500,7 @@ const App: React.FC = () => {
         updatePage({
             prompt,
             apiKey,
-            conversationId,
+            conversationId: glmConversationId,
             signal: controller.signal,
             onLog: handleLog,
             onPartial,
@@ -456,7 +524,7 @@ const App: React.FC = () => {
                             updated = true;
                         }
                     });
-                     return { ...prev, conversationId: convId, isLoading: false, generatedSlides: newSlides };
+                     return { ...prev, glmConversationId: convId, isLoading: false, generatedSlides: newSlides };
                 });
 
                 if (slides.length === 0) {
@@ -477,7 +545,7 @@ const App: React.FC = () => {
                 abortControllerRef.current = null;
             }
         });
-    }, [conversationId, handleLog, courseData.kbId]);
+    }, [glmConversationId, handleLog, courseData.kbId]);
 
     const handleCancelGeneration = useCallback(() => {
         if (abortControllerRef.current) {
@@ -608,7 +676,14 @@ const App: React.FC = () => {
 
     const handleStartOver = useCallback(() => {
         const nextStep = courseData.structureMethod === StructureMethod.AI ? 2 : 3;
-        setState(prev => ({ ...prev, generatedSlides: [], conversationId: null, error: null, step: nextStep }));
+        setState(prev => ({ 
+            ...prev,
+            generatedSlides: [],
+            glmConversationId: null,
+            error: null,
+            step: nextStep,
+            runId: crypto.randomUUID(), // Regenerate for new run
+        }));
     }, [courseData.structureMethod]);
     
     const handleSetCourseData = useCallback((data: Partial<CourseData> | ((prevState: Partial<CourseData>) => Partial<CourseData>)) => {
@@ -664,7 +739,7 @@ const App: React.FC = () => {
                             error={error}
                             onUpdateSlide={handleUpdateSlide}
                             onStartOver={handleStartOver}
-                            conversationId={conversationId}
+                            conversationId={glmConversationId}
                             onExport={handleExport}
                             isExporting={isExporting}
                             onCancelGeneration={handleCancelGeneration}
